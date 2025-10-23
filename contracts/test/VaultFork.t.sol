@@ -8,6 +8,8 @@ import {IWETH} from "../src/interfaces/IWETH.sol";
 import {IRouter} from "../src/interfaces/IRouter.sol";
 import {INonfungiblePositionManager} from "../src/interfaces/INonfungiblePositionManager.sol";
 import {ICLPool} from "../src/interfaces/ICLPool.sol";
+import {IPyth} from "@pythnetwork/IPyth.sol";
+import {PythStructs} from "@pythnetwork/PythStructs.sol";
 
 /**
  * @title VaultForkTest
@@ -42,6 +44,7 @@ contract VaultForkTest is Test {
         vm.deal(user2, 100 ether);
 
         // Deploy vault with real contracts
+        // Note: In zkSync fork tests, we need to ensure the contract can properly interact with other contracts
         vm.prank(admin);
         vault = new AboreanVault(
             WETH,
@@ -51,6 +54,67 @@ contract VaultForkTest is Test {
             ROUTER,
             POOL,
             PYTH
+        );
+
+        // Give vault some breathing room for gas in zkSync
+        vm.deal(address(vault), 10 ether);
+
+        // Mock Pyth price feeds since they may not be available on fork
+        _mockPythPrices();
+    }
+
+    /**
+     * @notice Mock Pyth oracle responses for fork tests
+     * @dev PENGU price feed may not be available on Abstract mainnet yet
+     */
+    function _mockPythPrices() internal {
+        // WETH/USD price: ~$3400 (8 decimals from Pyth: 340000000000)
+        // Converted to Pyth format: price = 340000000000, expo = -8
+        bytes memory wethPriceData = abi.encode(
+            int64(340000000000), // price: $3400 in 8 decimals
+            uint64(1000000000),  // conf: reasonable confidence
+            int32(-8),           // expo: -8 (8 decimals)
+            uint256(block.timestamp) // publishTime: current
+        );
+
+        // PENGU/USD price: ~$0.018 (price = 1800000, expo = -8)
+        bytes memory penguPriceData = abi.encode(
+            int64(1800000),      // price: $0.018 in 8 decimals
+            uint64(10000),       // conf: reasonable confidence
+            int32(-8),           // expo: -8
+            uint256(block.timestamp) // publishTime: current
+        );
+
+        // Mock the Pyth oracle getPriceNoOlderThan calls
+        bytes32 WETH_PRICE_ID = 0x9d4294bbcd1174d6f2003ec365831e64cc31d9f6f15a2b85399db8d5000960f6;
+        bytes32 PENGU_PRICE_ID = 0xbed3097008b9b5e3c93bec20be79cb43986b85a996475589351a21e67bae9b61;
+
+        // Create Price structs for mocking
+        PythStructs.Price memory wethPrice = PythStructs.Price({
+            price: int64(340000000000),
+            conf: uint64(1000000000),
+            expo: int32(-8),
+            publishTime: block.timestamp
+        });
+
+        PythStructs.Price memory penguPrice = PythStructs.Price({
+            price: int64(1800000),
+            conf: uint64(10000),
+            expo: int32(-8),
+            publishTime: block.timestamp
+        });
+
+        // Mock the Pyth calls
+        vm.mockCall(
+            PYTH,
+            abi.encodeWithSelector(IPyth.getPriceNoOlderThan.selector, WETH_PRICE_ID, 60),
+            abi.encode(wethPrice)
+        );
+
+        vm.mockCall(
+            PYTH,
+            abi.encodeWithSelector(IPyth.getPriceNoOlderThan.selector, PENGU_PRICE_ID, 60),
+            abi.encode(penguPrice)
         );
     }
 

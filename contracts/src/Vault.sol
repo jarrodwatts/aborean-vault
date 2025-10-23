@@ -8,6 +8,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 
 import {INonfungiblePositionManager} from "./interfaces/INonfungiblePositionManager.sol";
 import {ICLGauge} from "./interfaces/ICLGauge.sol";
@@ -20,13 +21,15 @@ import {PythStructs} from "@pythnetwork/PythStructs.sol";
 import {LiquidityAmounts} from "./libraries/LiquidityAmounts.sol";
 import {TickMath} from "./libraries/TickMath.sol";
 import {ICLPool} from "./interfaces/ICLPool.sol";
+import {FullMath} from "./libraries/FullMath.sol";
+import {FixedPoint96} from "./libraries/FixedPoint96.sol";
 
 /**
  * @title AboreanVault
  * @notice ERC-4626 compliant vault that auto-compounds yield from WETH/PENGU Concentrated Liquidity pool on Aborean
  * @dev Accepts WETH deposits, provides liquidity to Aborean WETH/PENGU CL pool, stakes in gauge, and compounds rewards
  */
-contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard {
+contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard, IERC721Receiver {
     using SafeERC20 for IERC20;
 
     /*//////////////////////////////////////////////////////////////
@@ -38,6 +41,10 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard {
 
     /// @notice Maximum slippage allowed on swaps in basis points (50 = 0.5%)
     uint256 public constant MAX_SLIPPAGE_BPS = 50;
+
+    /// @notice Slippage tolerance for CL position minting (500 = 5%)
+    /// @dev Higher than swap slippage because CL positions are sensitive to price/tick alignment
+    uint256 public constant LP_SLIPPAGE_BPS = 500;
 
     /// @notice Basis points scale (100% = 10000 bps)
     uint256 private constant BPS_SCALE = 10000;
@@ -220,6 +227,58 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard {
     //////////////////////////////////////////////////////////////*/
 
     /**
+     * @notice Calculate liquidity for a given amount of token0 and price range
+     * @dev Returns uint256 to avoid overflow during intermediate calculations
+     */
+    function _liquidityForAmount0(
+        uint160 sqrtRatioAX96,
+        uint160 sqrtRatioBX96,
+        uint256 amount0
+    ) internal pure returns (uint256 liquidity) {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        require(sqrtRatioBX96 > sqrtRatioAX96, "Invalid sqrt ratio range");
+        uint256 intermediate = FullMath.mulDiv(sqrtRatioAX96, sqrtRatioBX96, FixedPoint96.Q96);
+        liquidity = FullMath.mulDiv(amount0, intermediate, sqrtRatioBX96 - sqrtRatioAX96);
+    }
+
+    /**
+     * @notice Calculate liquidity for a given amount of token1 and price range
+     * @dev Returns uint256 to avoid overflow during intermediate calculations
+     */
+    function _liquidityForAmount1(
+        uint160 sqrtRatioAX96,
+        uint160 sqrtRatioBX96,
+        uint256 amount1
+    ) internal pure returns (uint256 liquidity) {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        require(sqrtRatioBX96 > sqrtRatioAX96, "Invalid sqrt ratio range");
+        liquidity = FullMath.mulDiv(amount1, FixedPoint96.Q96, sqrtRatioBX96 - sqrtRatioAX96);
+    }
+
+    /**
+     * @notice Calculate maximum liquidity for given token amounts and price range
+     * @dev Returns uint256 to avoid overflow during intermediate calculations
+     */
+    function _liquidityForAmounts(
+        uint160 sqrtRatioX96,
+        uint160 sqrtRatioAX96,
+        uint160 sqrtRatioBX96,
+        uint256 amount0,
+        uint256 amount1
+    ) internal pure returns (uint256 liquidity) {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        if (sqrtRatioX96 <= sqrtRatioAX96) {
+            liquidity = _liquidityForAmount0(sqrtRatioAX96, sqrtRatioBX96, amount0);
+        } else if (sqrtRatioX96 < sqrtRatioBX96) {
+            uint256 liquidity0 = _liquidityForAmount0(sqrtRatioX96, sqrtRatioBX96, amount0);
+            uint256 liquidity1 = _liquidityForAmount1(sqrtRatioAX96, sqrtRatioX96, amount1);
+            liquidity = liquidity0 < liquidity1 ? liquidity0 : liquidity1;
+        } else {
+            liquidity = _liquidityForAmount1(sqrtRatioAX96, sqrtRatioBX96, amount1);
+        }
+    }
+
+    /**
      * @notice Swap WETH for PENGU using Aborean Router
      * @param wethAmount Amount of WETH to swap
      * @return penguAmount Amount of PENGU received
@@ -265,13 +324,38 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard {
         // Calculate tick range (±20% from current price)
         (int24 tickLower, int24 tickUpper) = _calculateTickRange();
 
+        // Get current pool state
+        (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol) = ICLPool(pool).slot0();
+
+        // Calculate sqrt ratios for tick range
+        uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
+        uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
+
+        // Calculate expected liquidity for our token amounts
+        uint256 expectedLiquidity = _liquidityForAmounts(
+            sqrtPriceX96,
+            sqrtRatioAX96,
+            sqrtRatioBX96,
+            wethAmount,
+            penguAmount
+        );
+
+        // Calculate expected token consumption based on that liquidity
+        (uint256 expectedAmount0, uint256 expectedAmount1) = LiquidityAmounts.getAmountsForLiquidity(
+            sqrtPriceX96,
+            sqrtRatioAX96,
+            sqrtRatioBX96,
+            uint128(expectedLiquidity)
+        );
+
+        // Apply slippage tolerance (5%) to EXPECTED amounts, not input amounts
+        // This allows CL to use less tokens based on tick alignment
+        uint256 amount0Min = (expectedAmount0 * (BPS_SCALE - LP_SLIPPAGE_BPS)) / BPS_SCALE;
+        uint256 amount1Min = (expectedAmount1 * (BPS_SCALE - LP_SLIPPAGE_BPS)) / BPS_SCALE;
+
         // Approve Position Manager to spend tokens
         weth.approve(address(positionManager), wethAmount);
         pengu.approve(address(positionManager), penguAmount);
-
-        // Calculate minimum amounts with slippage protection
-        uint256 amount0Min = (wethAmount * (BPS_SCALE - MAX_SLIPPAGE_BPS)) / BPS_SCALE;
-        uint256 amount1Min = (penguAmount * (BPS_SCALE - MAX_SLIPPAGE_BPS)) / BPS_SCALE;
 
         // Mint new position
         INonfungiblePositionManager.MintParams memory params = INonfungiblePositionManager.MintParams({
@@ -303,13 +387,40 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard {
      * @param penguAmount Amount of PENGU to add
      */
     function _increaseLiquidity(uint256 wethAmount, uint256 penguAmount) internal {
+        // Get existing position info to use same tick range
+        (, , , , , int24 tickLower, int24 tickUpper, , , , , ) = positionManager.positions(nftTokenId);
+
+        // Get current pool state
+        (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol) = ICLPool(pool).slot0();
+
+        // Calculate sqrt ratios for tick range
+        uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
+        uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
+
+        // Calculate expected liquidity for our token amounts
+        uint256 expectedLiquidity = _liquidityForAmounts(
+            sqrtPriceX96,
+            sqrtRatioAX96,
+            sqrtRatioBX96,
+            wethAmount,
+            penguAmount
+        );
+
+        // Calculate expected token consumption based on that liquidity
+        (uint256 expectedAmount0, uint256 expectedAmount1) = LiquidityAmounts.getAmountsForLiquidity(
+            sqrtPriceX96,
+            sqrtRatioAX96,
+            sqrtRatioBX96,
+            uint128(expectedLiquidity)
+        );
+
+        // Apply slippage tolerance (5%) to EXPECTED amounts
+        uint256 amount0Min = (expectedAmount0 * (BPS_SCALE - LP_SLIPPAGE_BPS)) / BPS_SCALE;
+        uint256 amount1Min = (expectedAmount1 * (BPS_SCALE - LP_SLIPPAGE_BPS)) / BPS_SCALE;
+
         // Approve Position Manager to spend tokens
         weth.approve(address(positionManager), wethAmount);
         pengu.approve(address(positionManager), penguAmount);
-
-        // Calculate minimum amounts with slippage protection
-        uint256 amount0Min = (wethAmount * (BPS_SCALE - MAX_SLIPPAGE_BPS)) / BPS_SCALE;
-        uint256 amount1Min = (penguAmount * (BPS_SCALE - MAX_SLIPPAGE_BPS)) / BPS_SCALE;
 
         // Increase liquidity
         INonfungiblePositionManager.IncreaseLiquidityParams memory params =
@@ -463,9 +574,25 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard {
         // not vault valuation. The actual USD valuation in totalAssets() uses Pyth oracle.
         (uint160 sqrtPriceX96, , , , , ) = ICLPool(pool).slot0();
 
+        // Validate ticks are not equal (would cause division issues)
+        if (tickLower >= tickUpper) return (0, 0);
+
+        // Validate ticks are in valid range before converting to sqrt ratios
+        int24 MIN_TICK = -887272;
+        int24 MAX_TICK = 887272;
+        if (tickLower < MIN_TICK || tickLower > MAX_TICK || tickUpper < MIN_TICK || tickUpper > MAX_TICK) {
+            return (0, 0);
+        }
+
         // Convert tick boundaries to sqrtPriceX96 format
         uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
         uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
+
+        // Additional safety check
+        if (sqrtRatioAX96 == 0 || sqrtRatioBX96 == 0 || sqrtRatioAX96 >= sqrtRatioBX96) return (0, 0);
+
+        // Ensure sqrt price is in valid range
+        if (sqrtPriceX96 == 0) return (0, 0);
 
         // Calculate token amounts using Uniswap V3 LiquidityAmounts library
         // This handles all cases: in-range, above-range, below-range
@@ -475,6 +602,24 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard {
             sqrtRatioBX96,
             liquidity
         );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        ERC721 RECEIVER IMPLEMENTATION
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Handle ERC-721 NFT transfers (required to receive Position Manager NFTs)
+     * @dev Always accepts NFTs from Position Manager
+     * @return Selector to confirm the contract can receive ERC-721 tokens
+     */
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external override returns (bytes4) {
+        return IERC721Receiver.onERC721Received.selector;
     }
 
     /*//////////////////////////////////////////////////////////////
