@@ -14,6 +14,8 @@ import {INonfungiblePositionManager} from "./interfaces/INonfungiblePositionMana
 import {ICLGauge} from "./interfaces/ICLGauge.sol";
 import {IRouter} from "./interfaces/IRouter.sol";
 import {IWETH} from "./interfaces/IWETH.sol";
+import {IVotingEscrow} from "./interfaces/IVotingEscrow.sol";
+import {IVoter} from "./interfaces/IVoter.sol";
 
 import {IPyth} from "@pythnetwork/IPyth.sol";
 import {PythStructs} from "@pythnetwork/PythStructs.sol";
@@ -83,11 +85,14 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard, IERC721Rec
     /// @notice Pyth oracle contract (0x8739d5024B5143278E2b15Bd9e7C26f6CEc658F1 on mainnet)
     IPyth public immutable pyth;
 
+    /// @notice VotingEscrow contract for locking ABX (0x27B04370D8087e714a9f557c1EFF7901cea6bB63)
+    IVotingEscrow public immutable votingEscrow;
+
+    /// @notice Voter contract for voting on pool emissions (0xC0F53703e9f4b79fA2FB09a2aeBA487FA97729c9)
+    IVoter public immutable voter;
+
     /// @notice Tick spacing for CL200 pool
     int24 public constant TICK_SPACING = 200;
-
-    /// @notice Pool fee in hundredths of a basis point (3000 = 0.3%)
-    uint24 public constant POOL_FEE = 3000;
 
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
@@ -97,8 +102,8 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard, IERC721Rec
     /// @dev 0 means no position exists yet
     uint256 public nftTokenId;
 
-    /// @notice The veABX NFT token ID for our locked governance position
-    /// @dev 0 means no veABX position exists yet
+    /// @notice The veABX NFT token ID for governance voting
+    /// @dev 0 means no veABX NFT exists yet
     uint256 public veABXTokenId;
 
     /*//////////////////////////////////////////////////////////////
@@ -114,6 +119,8 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard, IERC721Rec
      * @param _router Address of Router (0xE8142D2f82036B6FC1e79E4aE85cF53FBFfDC998)
      * @param _pool Address of WETH/PENGU CL Pool (0xB3131C7F642be362acbEe0dd0b3e0acc6f05fcDC)
      * @param _pyth Address of Pyth oracle (0x8739d5024B5143278E2b15Bd9e7C26f6CEc658F1 on mainnet)
+     * @param _votingEscrow Address of VotingEscrow (0x27B04370D8087e714a9f557c1EFF7901cea6bB63)
+     * @param _voter Address of Voter (0xC0F53703e9f4b79fA2FB09a2aeBA487FA97729c9)
      */
     constructor(
         address _weth,
@@ -122,10 +129,12 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard, IERC721Rec
         address _gauge,
         address _router,
         address _pool,
-        address _pyth
+        address _pyth,
+        address _votingEscrow,
+        address _voter
     )
         ERC4626(IERC20(_weth))
-        ERC20("Aborean WETH/PENGU Vault", "aborWETH-PENGU")
+        ERC20("Aborean WETH/PENGU Vault", "wvaulth")
         Ownable(msg.sender)
     {
         require(_weth != address(0), "Invalid WETH address");
@@ -135,6 +144,8 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard, IERC721Rec
         require(_router != address(0), "Invalid Router");
         require(_pool != address(0), "Invalid Pool");
         require(_pyth != address(0), "Invalid Pyth address");
+        require(_votingEscrow != address(0), "Invalid VotingEscrow address");
+        require(_voter != address(0), "Invalid Voter address");
 
         weth = IWETH(_weth);
         pengu = IERC20(_pengu);
@@ -143,6 +154,8 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard, IERC721Rec
         router = IRouter(_router);
         pool = _pool;
         pyth = IPyth(_pyth);
+        votingEscrow = IVotingEscrow(_votingEscrow);
+        voter = IVoter(_voter);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -220,6 +233,111 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard, IERC721Rec
             positionManager.approve(address(gauge), nftTokenId);
             gauge.deposit(nftTokenId);
         }
+    }
+
+    /**
+     * @notice Override withdraw logic to remove liquidity and return WETH
+     * @dev Called by parent ERC4626.withdraw() and redeem()
+     * @param caller The address calling withdraw/redeem
+     * @param receiver The address receiving withdrawn assets
+     * @param owner The owner of the shares being burned
+     * @param assets Amount of WETH to withdraw
+     * @param shares Amount of vault shares to burn
+     */
+    function _withdraw(
+        address caller,
+        address receiver,
+        address owner,
+        uint256 assets,
+        uint256 shares
+    ) internal override whenNotPaused nonReentrant {
+        // Calculate what percentage of the position to withdraw
+        uint256 totalShares = totalSupply();
+        require(totalShares > 0, "No shares to withdraw");
+        
+        // Get position info before unstaking
+        (, , , , , int24 tickLower, int24 tickUpper, uint128 currentLiquidity, , , , ) = 
+            positionManager.positions(nftTokenId);
+
+        // Calculate liquidity to remove (proportional to shares being burned)
+        uint128 liquidityToRemove = uint128((uint256(currentLiquidity) * shares) / totalShares);
+
+        // Unstake from gauge
+        gauge.withdraw(nftTokenId);
+
+        // Collect any accrued fees first
+        positionManager.collect(
+            INonfungiblePositionManager.CollectParams({
+                tokenId: nftTokenId,
+                recipient: address(this),
+                amount0Max: type(uint128).max,
+                amount1Max: type(uint128).max
+            })
+        );
+
+        // Decrease liquidity
+        if (liquidityToRemove > 0) {
+            positionManager.decreaseLiquidity(
+                INonfungiblePositionManager.DecreaseLiquidityParams({
+                    tokenId: nftTokenId,
+                    liquidity: liquidityToRemove,
+                    amount0Min: 0,  // Accept any amount (protected by totalAssets calculation)
+                    amount1Min: 0,
+                    deadline: block.timestamp
+                })
+            );
+
+            // Collect the decreased liquidity tokens
+            (uint256 wethReceived, uint256 penguReceived) = positionManager.collect(
+                INonfungiblePositionManager.CollectParams({
+                    tokenId: nftTokenId,
+                    recipient: address(this),
+                    amount0Max: type(uint128).max,
+                    amount1Max: type(uint128).max
+                })
+            );
+
+            // Swap PENGU → WETH to get the required amount
+            if (penguReceived > 0) {
+                wethReceived += _swapPENGUForWETH(penguReceived);
+            }
+            
+            // Verify we received enough WETH (allow 2% slippage tolerance)
+            uint256 minAcceptable = (assets * 98) / 100;
+            require(wethReceived >= minAcceptable, "Insufficient withdrawal amount");
+        }
+
+        // Re-stake remaining position if there's still liquidity
+        (, , , , , , , uint128 remainingLiquidity, , , , ) = 
+            positionManager.positions(nftTokenId);
+        
+        if (remainingLiquidity > 0) {
+            positionManager.approve(address(gauge), nftTokenId);
+            gauge.deposit(nftTokenId);
+        }
+
+        // Call parent to handle share burning and transfer (vault → receiver)
+        super._withdraw(caller, receiver, owner, assets, shares);
+    }
+
+    /**
+     * @notice Override maxWithdraw to account for pause state
+     * @param owner The address to check withdrawal limit for
+     * @return Maximum withdrawable assets
+     */
+    function maxWithdraw(address owner) public view override returns (uint256) {
+        if (paused()) return 0;
+        return super.maxWithdraw(owner);
+    }
+
+    /**
+     * @notice Override maxRedeem to account for pause state
+     * @param owner The address to check redemption limit for
+     * @return Maximum redeemable shares
+     */
+    function maxRedeem(address owner) public view override returns (uint256) {
+        if (paused()) return 0;
+        return super.maxRedeem(owner);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -313,6 +431,43 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard, IERC721Rec
         );
 
         penguAmount = amounts[amounts.length - 1];
+    }
+
+    /**
+     * @notice Swap PENGU for WETH using Aborean Router
+     * @param penguAmount Amount of PENGU to swap
+     * @return wethAmount Amount of WETH received
+     */
+    function _swapPENGUForWETH(uint256 penguAmount) internal returns (uint256 wethAmount) {
+        // Build route: PENGU → WETH (volatile pool)
+        IRouter.Route[] memory routes = new IRouter.Route[](1);
+        routes[0] = IRouter.Route({
+            from: address(pengu),
+            to: address(weth),
+            stable: false,        // volatile pool for PENGU/WETH
+            factory: address(0)   // use default factory
+        });
+
+        // Get expected output amount
+        uint256[] memory amountsOut = router.getAmountsOut(penguAmount, routes);
+        uint256 expectedWeth = amountsOut[amountsOut.length - 1];
+
+        // Calculate minimum with slippage protection
+        uint256 minWethOut = (expectedWeth * (BPS_SCALE - MAX_SLIPPAGE_BPS)) / BPS_SCALE;
+
+        // Approve router to spend PENGU
+        pengu.approve(address(router), penguAmount);
+
+        // Execute swap
+        uint256[] memory amounts = router.swapExactTokensForTokens(
+            penguAmount,
+            minWethOut,
+            routes,
+            address(this),
+            block.timestamp
+        );
+
+        wethAmount = amounts[amounts.length - 1];
     }
 
     /**
@@ -627,6 +782,281 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard, IERC721Rec
     //////////////////////////////////////////////////////////////*/
 
     /**
+     * @notice Harvest ABX rewards and trading fees from the staked position
+     * @dev Claims rewards without unstaking the NFT
+     */
+    function harvest() external onlyOwner {
+        if (nftTokenId == 0) return;
+
+        // Track ABX balance before claiming
+        address abxToken = gauge.rewardToken();
+        uint256 abxBefore = IERC20(abxToken).balanceOf(address(this));
+        
+        // Claim ABX rewards from gauge (position stays staked)
+        gauge.getReward(nftTokenId);
+        
+        // Calculate ABX received
+        uint256 abxAmount = IERC20(abxToken).balanceOf(address(this)) - abxBefore;
+
+        // Collect trading fees from position
+        (uint256 wethFees, uint256 penguFees) = positionManager.collect(
+            INonfungiblePositionManager.CollectParams({
+                tokenId: nftTokenId,
+                recipient: address(this),
+                amount0Max: type(uint128).max,
+                amount1Max: type(uint128).max
+            })
+        );
+
+        emit Harvest(abxAmount, wethFees, penguFees);
+    }
+
+    /**
+     * @notice Compound trading fees back into the LP position
+     * @dev Collects fees, balances tokens via swap, and adds back as liquidity
+     */
+    function compound() external onlyOwner {
+        if (nftTokenId == 0) return;
+
+        // Collect trading fees
+        (uint256 wethCollected, uint256 penguCollected) = positionManager.collect(
+            INonfungiblePositionManager.CollectParams({
+                tokenId: nftTokenId,
+                recipient: address(this),
+                amount0Max: type(uint128).max,
+                amount1Max: type(uint128).max
+            })
+        );
+
+        if (wethCollected > 0.001 ether || penguCollected > 1 ether) {
+            uint256 totalWeth = wethCollected;
+            uint256 totalPengu = penguCollected;
+
+            // Balance tokens to 50/50 value split (rough approximation)
+            uint256 targetWeth = (wethCollected + penguCollected / 2000) / 2;
+            uint256 targetPengu = (wethCollected * 2000 + penguCollected) / 2;
+
+            if (totalWeth < targetWeth && totalPengu > 0) {
+                uint256 penguToSwap = totalPengu / 2;
+                if (penguToSwap > 0) {
+                    totalWeth += _swapPENGUForWETH(penguToSwap);
+                    totalPengu -= penguToSwap;
+                }
+            } else if (totalPengu < targetPengu && totalWeth > 0) {
+                uint256 wethToSwap = totalWeth / 2;
+                if (wethToSwap > 0) {
+                    totalPengu += _swapWETHForPENGU(wethToSwap);
+                    totalWeth -= wethToSwap;
+                }
+            }
+
+            // Must unstake to increase liquidity, then re-stake
+            if (totalWeth > 0 && totalPengu > 0) {
+                gauge.withdraw(nftTokenId);
+                _increaseLiquidity(totalWeth, totalPengu);
+                positionManager.approve(address(gauge), nftTokenId);
+                gauge.deposit(nftTokenId);
+            }
+
+            emit Compound(totalWeth, totalPengu, totalAssets());
+        }
+    }
+
+    /**
+     * @notice Rebalance the LP position to a new tick range
+     * @dev Useful when price has moved significantly and position is out of range
+     */
+    function rebalance() external onlyOwner {
+        if (nftTokenId == 0) return;
+
+        // Unstake from gauge
+        gauge.withdraw(nftTokenId);
+
+        // Get current position
+        (, , , , , , , uint128 liquidity, , , , ) = positionManager.positions(nftTokenId);
+
+        // Remove all liquidity from old position
+        if (liquidity > 0) {
+            positionManager.decreaseLiquidity(
+                INonfungiblePositionManager.DecreaseLiquidityParams({
+                    tokenId: nftTokenId,
+                    liquidity: liquidity,
+                    amount0Min: 0,
+                    amount1Min: 0,
+                    deadline: block.timestamp
+                })
+            );
+
+            // Collect tokens
+            (uint256 wethAmount, uint256 penguAmount) = positionManager.collect(
+                INonfungiblePositionManager.CollectParams({
+                    tokenId: nftTokenId,
+                    recipient: address(this),
+                    amount0Max: type(uint128).max,
+                    amount1Max: type(uint128).max
+                })
+            );
+
+            // Calculate new tick range around current price
+            (int24 tickLower, int24 tickUpper) = _calculateTickRange();
+
+            // Re-add liquidity with new range using existing position
+            // Get current tick for the new range parameters
+            (, int24 currentTick, , , , ) = ICLPool(pool).slot0();
+
+            // Calculate expected liquidity for slippage protection
+            uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(currentTick);
+            uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
+            uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
+
+            uint256 expectedLiquidity = _liquidityForAmounts(
+                sqrtPriceX96,
+                sqrtRatioAX96,
+                sqrtRatioBX96,
+                wethAmount,
+                penguAmount
+            );
+
+            (uint256 expectedAmount0, uint256 expectedAmount1) = LiquidityAmounts.getAmountsForLiquidity(
+                sqrtPriceX96,
+                sqrtRatioAX96,
+                sqrtRatioBX96,
+                uint128(expectedLiquidity)
+            );
+
+            uint256 amount0Min = (expectedAmount0 * (BPS_SCALE - LP_SLIPPAGE_BPS)) / BPS_SCALE;
+            uint256 amount1Min = (expectedAmount1 * (BPS_SCALE - LP_SLIPPAGE_BPS)) / BPS_SCALE;
+
+            // Approve tokens
+            weth.approve(address(positionManager), wethAmount);
+            pengu.approve(address(positionManager), penguAmount);
+
+            // Increase liquidity with new range
+            _increaseLiquidity(wethAmount, penguAmount);
+
+            // Re-stake
+            positionManager.approve(address(gauge), nftTokenId);
+            gauge.deposit(nftTokenId);
+
+            emit Rebalanced(tickLower, tickUpper, block.timestamp);
+        }
+    }
+
+    /**
+     * @notice Emergency withdrawal to recover all funds if something goes wrong
+     * @dev Only callable by owner when paused. Removes all liquidity and unstakes.
+     */
+    function emergencyWithdraw() external onlyOwner whenPaused {
+        if (nftTokenId == 0) return;
+
+        // Unstake from gauge
+        gauge.withdraw(nftTokenId);
+
+        // Get current position
+        (, , , , , , , uint128 liquidity, , , , ) = positionManager.positions(nftTokenId);
+
+        // Remove all liquidity
+        if (liquidity > 0) {
+            positionManager.decreaseLiquidity(
+                INonfungiblePositionManager.DecreaseLiquidityParams({
+                    tokenId: nftTokenId,
+                    liquidity: liquidity,
+                    amount0Min: 0,
+                    amount1Min: 0,
+                    deadline: block.timestamp
+                })
+            );
+
+            // Collect tokens
+            positionManager.collect(
+                INonfungiblePositionManager.CollectParams({
+                    tokenId: nftTokenId,
+                    recipient: owner(),
+                    amount0Max: type(uint128).max,
+                    amount1Max: type(uint128).max
+                })
+            );
+        }
+
+        // Transfer any remaining tokens to owner
+        uint256 wethBalance = weth.balanceOf(address(this));
+        uint256 penguBalance = pengu.balanceOf(address(this));
+        
+        if (wethBalance > 0) {
+            weth.transfer(owner(), wethBalance);
+        }
+        if (penguBalance > 0) {
+            pengu.transfer(owner(), penguBalance);
+        }
+    }
+
+    /**
+     * @notice Recover accidentally sent ERC20 tokens
+     * @dev Cannot recover WETH/PENGU as they're part of the vault strategy
+     * @param token Address of token to recover
+     * @param amount Amount to recover
+     */
+    function recoverERC20(address token, uint256 amount) external onlyOwner {
+        require(token != address(weth), "Cannot recover WETH");
+        require(token != address(pengu), "Cannot recover PENGU");
+        IERC20(token).safeTransfer(owner(), amount);
+    }
+
+    /**
+     * @notice Lock harvested ABX tokens to create or add to veABX position
+     * @dev Creates a new 4-year max lock veNFT if one doesn't exist, otherwise adds to existing lock
+     * @param minAbxAmount Minimum ABX balance required to execute lock (prevents wasting gas on dust)
+     */
+    function lockABX(uint256 minAbxAmount) external onlyOwner {
+        address abxToken = gauge.rewardToken();
+        uint256 abxBalance = IERC20(abxToken).balanceOf(address(this));
+        
+        require(abxBalance >= minAbxAmount, "Insufficient ABX balance");
+        require(abxBalance > 0, "No ABX to lock");
+
+        // Approve VotingEscrow to spend ABX
+        IERC20(abxToken).approve(address(votingEscrow), abxBalance);
+
+        if (veABXTokenId == 0) {
+            // Create new 4-year max lock
+            uint256 lockDuration = 4 * 365 days; // 4 years
+            veABXTokenId = votingEscrow.createLock(abxBalance, lockDuration);
+            emit ABXLocked(veABXTokenId, abxBalance, lockDuration);
+        } else {
+            // Add to existing lock
+            votingEscrow.increaseAmount(veABXTokenId, abxBalance);
+            emit ABXLocked(veABXTokenId, abxBalance, 0);
+        }
+
+        // Clear approval
+        IERC20(abxToken).approve(address(votingEscrow), 0);
+    }
+
+    /**
+     * @notice Vote for the WETH/PENGU pool to direct ABX emissions
+     * @dev Allocates 100% of veABX voting power to our pool
+     * @dev Can only vote once per epoch (weekly, Thursdays 00:00 UTC)
+     */
+    function voteForPool() external onlyOwner {
+        require(veABXTokenId != 0, "No veABX NFT exists");
+        
+        // Get voting power
+        uint256 votingPower = votingEscrow.balanceOfNFT(veABXTokenId);
+        require(votingPower > 0, "No voting power");
+
+        // Vote for our pool with 100% weight
+        address[] memory pools = new address[](1);
+        pools[0] = pool;
+        
+        uint256[] memory weights = new uint256[](1);
+        weights[0] = votingPower; // Allocate 100% weight to our pool
+
+        voter.vote(veABXTokenId, pools, weights);
+        
+        emit VotedForPool(veABXTokenId, pool, votingPower);
+    }
+
+    /**
      * @notice Pause vault deposits and withdrawals (emergency only)
      */
     function pause() external onlyOwner {
@@ -646,7 +1076,7 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard, IERC721Rec
 
     event Harvest(uint256 abxAmount, uint256 wethFees, uint256 penguFees);
     event Compound(uint256 wethAdded, uint256 penguAdded, uint256 newTotalAssets);
-    event ABXLocked(uint256 amount, uint256 veABXTokenId);
-    event Voted(uint256 veABXTokenId, address indexed pool, uint256 votingPower);
     event Rebalanced(int24 newTickLower, int24 newTickUpper, uint256 timestamp);
+    event ABXLocked(uint256 indexed veTokenId, uint256 abxAmount, uint256 lockDuration);
+    event VotedForPool(uint256 indexed veTokenId, address indexed pool, uint256 weight);
 }

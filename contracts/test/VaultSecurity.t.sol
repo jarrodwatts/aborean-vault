@@ -5,7 +5,7 @@ import {Test, console2} from "forge-std/Test.sol";
 import {AboreanVault} from "../src/Vault.sol";
 import {MockVault} from "./mocks/MockVault.sol";
 import {AboreanVault as _AboreanVault} from "../src/Vault.sol";
-import {MockWETH, MockPENGU, MockPyth, MockRouter, MockPositionManager, MockCLGauge, MockUniswapV3Pool} from "./mocks/Mocks.sol";
+import {MockWETH, MockPENGU, MockPyth, MockRouter, MockPositionManager, MockCLGauge, MockUniswapV3Pool, MockVotingEscrow, MockVoter} from "./mocks/Mocks.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /**
@@ -39,6 +39,8 @@ contract VaultSecurityTest is Test {
         positionManager = new MockPositionManager();
         gauge = new MockCLGauge(address(positionManager));
         pool = new MockUniswapV3Pool();
+        MockVotingEscrow votingEscrow = new MockVotingEscrow();
+        MockVoter voter = new MockVoter();
 
         pool.setSqrtPriceX96(3540000000000000000000, 0);
 
@@ -48,7 +50,8 @@ contract VaultSecurityTest is Test {
         vm.prank(admin);
         vault = new MockVault(
             address(weth), address(pengu), address(positionManager),
-            address(gauge), address(router), address(pool), address(pyth)
+            address(gauge), address(router), address(pool), address(pyth),
+            address(votingEscrow), address(voter)
         );
 
         // Set oracle prices

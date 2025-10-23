@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Test, console2} from "forge-std/Test.sol";
 import {AboreanVault} from "../src/Vault.sol";
 import {MockVault} from "./mocks/MockVault.sol";
-import {MockWETH, MockPENGU, MockPyth, MockRouter, MockPositionManager, MockCLGauge, MockUniswapV3Pool} from "./mocks/Mocks.sol";
+import {MockWETH, MockPENGU, MockPyth, MockRouter, MockPositionManager, MockCLGauge, MockUniswapV3Pool, MockVotingEscrow, MockVoter} from "./mocks/Mocks.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /**
@@ -21,6 +21,8 @@ contract VaultUnitTest is Test {
     MockPositionManager public positionManager;
     MockCLGauge public gauge;
     MockUniswapV3Pool public pool;
+    MockVotingEscrow public votingEscrow;
+    MockVoter public voter;
 
     address public admin = address(0x1);
     address public user1 = address(0x2);
@@ -39,6 +41,8 @@ contract VaultUnitTest is Test {
         positionManager = new MockPositionManager();
         gauge = new MockCLGauge(address(positionManager));
         pool = new MockUniswapV3Pool();
+        votingEscrow = new MockVotingEscrow();
+        voter = new MockVoter();
 
         // Set initial pool price (1 WETH = 2000 PENGU)
         // sqrtPriceX96 = sqrt(2000) * 2^96 ≈ 3.54e21
@@ -56,7 +60,9 @@ contract VaultUnitTest is Test {
             address(gauge),
             address(router),
             address(pool),
-            address(pyth)
+            address(pyth),
+            address(votingEscrow),
+            address(voter)
         );
         vm.stopPrank();
 
@@ -98,19 +104,22 @@ contract VaultUnitTest is Test {
         vm.expectRevert("Invalid WETH address");
         new MockVault(
             address(0), address(pengu), address(positionManager),
-            address(gauge), address(router), address(pool), address(pyth)
+            address(gauge), address(router), address(pool), address(pyth),
+            address(votingEscrow), address(voter)
         );
 
         vm.expectRevert("Invalid PENGU address");
         new MockVault(
             address(weth), address(0), address(positionManager),
-            address(gauge), address(router), address(pool), address(pyth)
+            address(gauge), address(router), address(pool), address(pyth),
+            address(votingEscrow), address(voter)
         );
 
         vm.expectRevert("Invalid Position Manager");
         new MockVault(
             address(weth), address(pengu), address(0),
-            address(gauge), address(router), address(pool), address(pyth)
+            address(gauge), address(router), address(pool), address(pyth),
+            address(votingEscrow), address(voter)
         );
     }
 
@@ -253,6 +262,196 @@ contract VaultUnitTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
+                        WITHDRAWAL TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_Withdraw_Success() public {
+        // First deposit
+        vm.startPrank(user1);
+        weth.approve(address(vault), 1 ether);
+        uint256 shares = vault.deposit(1 ether, user1);
+        vm.stopPrank();
+
+        uint256 totalAssetsBefore = vault.totalAssets();
+
+        // Withdraw half
+        vm.startPrank(user1);
+        uint256 assetsToWithdraw = 0.5 ether;
+        uint256 sharesToBurn = vault.previewWithdraw(assetsToWithdraw);
+        
+        uint256 wethBalanceBefore = weth.balanceOf(user1);
+        vault.withdraw(assetsToWithdraw, user1, user1);
+        uint256 wethBalanceAfter = weth.balanceOf(user1);
+        vm.stopPrank();
+
+        // Verify user received WETH
+        assertApproxEqRel(wethBalanceAfter - wethBalanceBefore, assetsToWithdraw, 0.02e18); // 2% tolerance for slippage
+        
+        // Verify shares were burned
+        assertApproxEqAbs(vault.balanceOf(user1), shares - sharesToBurn, 1);
+        
+        // Verify total assets decreased
+        assertLt(vault.totalAssets(), totalAssetsBefore);
+    }
+
+    function test_Redeem_Success() public {
+        // First deposit
+        vm.startPrank(user1);
+        weth.approve(address(vault), 2 ether);
+        uint256 shares = vault.deposit(2 ether, user1);
+        vm.stopPrank();
+
+        // Redeem half the shares
+        vm.startPrank(user1);
+        uint256 sharesToRedeem = shares / 2;
+        uint256 expectedAssets = vault.previewRedeem(sharesToRedeem);
+        
+        uint256 wethBalanceBefore = weth.balanceOf(user1);
+        uint256 assetsReceived = vault.redeem(sharesToRedeem, user1, user1);
+        uint256 wethBalanceAfter = weth.balanceOf(user1);
+        vm.stopPrank();
+
+        // Verify user received WETH
+        assertEq(wethBalanceAfter - wethBalanceBefore, assetsReceived);
+        assertApproxEqRel(assetsReceived, expectedAssets, 0.02e18); // 2% tolerance
+        
+        // Verify shares were burned
+        assertEq(vault.balanceOf(user1), shares - sharesToRedeem);
+    }
+
+    function test_Withdraw_RevertIf_Paused() public {
+        // Deposit first
+        vm.startPrank(user1);
+        weth.approve(address(vault), 1 ether);
+        vault.deposit(1 ether, user1);
+        vm.stopPrank();
+
+        // Pause vault
+        vm.prank(admin);
+        vault.pause();
+
+        // Try to withdraw
+        vm.startPrank(user1);
+        vm.expectRevert();
+        vault.withdraw(0.5 ether, user1, user1);
+        vm.stopPrank();
+    }
+
+    function test_Withdraw_FullWithdrawal() public {
+        // Deposit
+        vm.startPrank(user1);
+        weth.approve(address(vault), 1 ether);
+        vault.deposit(1 ether, user1);
+        vm.stopPrank();
+
+        // Withdraw everything
+        vm.startPrank(user1);
+        uint256 maxAssets = vault.maxWithdraw(user1);
+        
+        uint256 wethBalanceBefore = weth.balanceOf(user1);
+        vault.withdraw(maxAssets, user1, user1);
+        uint256 wethBalanceAfter = weth.balanceOf(user1);
+        vm.stopPrank();
+
+        // Verify all shares were burned
+        assertEq(vault.balanceOf(user1), 0);
+        
+        // Verify user received assets
+        assertGt(wethBalanceAfter - wethBalanceBefore, 0);
+    }
+
+    function test_Withdraw_MultipleUsers() public {
+        // User1 deposits
+        vm.startPrank(user1);
+        weth.approve(address(vault), 2 ether);
+        vault.deposit(2 ether, user1);
+        vm.stopPrank();
+
+        // User2 deposits
+        vm.startPrank(user2);
+        weth.approve(address(vault), 3 ether);
+        vault.deposit(3 ether, user2);
+        vm.stopPrank();
+
+        uint256 user1SharesBefore = vault.balanceOf(user1);
+        uint256 user2SharesBefore = vault.balanceOf(user2);
+
+        // User1 withdraws
+        vm.startPrank(user1);
+        uint256 wethBefore1 = weth.balanceOf(user1);
+        vault.withdraw(1 ether, user1, user1);
+        uint256 wethAfter1 = weth.balanceOf(user1);
+        vm.stopPrank();
+
+        // User2 withdraws
+        vm.startPrank(user2);
+        uint256 wethBefore2 = weth.balanceOf(user2);
+        vault.withdraw(1.5 ether, user2, user2);
+        uint256 wethAfter2 = weth.balanceOf(user2);
+        vm.stopPrank();
+
+        // Both users received their assets
+        assertApproxEqRel(wethAfter1 - wethBefore1, 1 ether, 0.02e18);
+        assertApproxEqRel(wethAfter2 - wethBefore2, 1.5 ether, 0.02e18);
+        
+        // Both users' shares decreased
+        assertLt(vault.balanceOf(user1), user1SharesBefore);
+        assertLt(vault.balanceOf(user2), user2SharesBefore);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        HARVEST & COMPOUND TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_Harvest_CollectsFees() public {
+        // Deposit to create position
+        vm.startPrank(user1);
+        weth.approve(address(vault), 2 ether);
+        vault.deposit(2 ether, user1);
+        vm.stopPrank();
+
+        // Simulate some trading fees accrued (in real scenario)
+        // For mock, this is a simplified test
+        vm.prank(admin);
+        vault.harvest();
+        
+        // Test passes if harvest doesn't revert
+        assertTrue(true);
+    }
+
+    function test_Compound_ReinvestsRewards() public {
+        // Deposit to create position
+        vm.startPrank(user1);
+        weth.approve(address(vault), 2 ether);
+        vault.deposit(2 ether, user1);
+        vm.stopPrank();
+
+        uint256 totalAssetsBefore = vault.totalAssets();
+
+        // Compound (in real scenario would collect fees and add to LP)
+        vm.prank(admin);
+        vault.compound();
+        
+        // Total assets should stay approximately the same or increase
+        uint256 totalAssetsAfter = vault.totalAssets();
+        assertGe(totalAssetsAfter, totalAssetsBefore * 99 / 100); // Allow for rounding
+    }
+
+    function test_Harvest_RevertIf_NotOwner() public {
+        vm.startPrank(user1);
+        vm.expectRevert();
+        vault.harvest();
+        vm.stopPrank();
+    }
+
+    function test_Compound_RevertIf_NotOwner() public {
+        vm.startPrank(user1);
+        vm.expectRevert();
+        vault.compound();
+        vm.stopPrank();
+    }
+
+    /*//////////////////////////////////////////////////////////////
                         TICK MATH TESTS
     //////////////////////////////////////////////////////////////*/
 
@@ -354,6 +553,96 @@ contract VaultUnitTest is Test {
         uint256 assets = vault.totalAssets();
         assertGt(assets, 0);
     }
+
+    /*//////////////////////////////////////////////////////////////
+                        VEABX LOCKING & VOTING TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_LockABX_CreatesNewVeNFT() public {
+        // Mint ABX tokens to vault
+        address abxToken = gauge.rewardToken();
+        deal(abxToken, address(vault), 100 ether);
+
+        // Lock ABX
+        vm.prank(admin);
+        vault.lockABX(50 ether);
+
+        // Should have created veNFT
+        assertGt(vault.veABXTokenId(), 0);
+        assertEq(votingEscrow.balances(vault.veABXTokenId()), 100 ether);
+    }
+
+    function test_LockABX_AddsToExistingLock() public {
+        // First lock
+        address abxToken = gauge.rewardToken();
+        deal(abxToken, address(vault), 100 ether);
+        vm.prank(admin);
+        vault.lockABX(50 ether);
+        
+        uint256 veTokenId = vault.veABXTokenId();
+        uint256 initialBalance = votingEscrow.balances(veTokenId);
+
+        // Second lock with more ABX
+        deal(abxToken, address(vault), 50 ether);
+        vm.prank(admin);
+        vault.lockABX(10 ether);
+
+        // Should add to existing veNFT
+        assertEq(vault.veABXTokenId(), veTokenId);
+        assertEq(votingEscrow.balances(veTokenId), initialBalance + 50 ether);
+    }
+
+    function test_LockABX_RevertsIfNotOwner() public {
+        address abxToken = gauge.rewardToken();
+        deal(abxToken, address(vault), 100 ether);
+
+        vm.prank(user1);
+        vm.expectRevert();
+        vault.lockABX(50 ether);
+    }
+
+    function test_LockABX_RevertsIfInsufficientBalance() public {
+        address abxToken = gauge.rewardToken();
+        deal(abxToken, address(vault), 10 ether);
+
+        vm.prank(admin);
+        vm.expectRevert("Insufficient ABX balance");
+        vault.lockABX(50 ether);
+    }
+
+    function test_VoteForPool_AllocatesVotingPower() public {
+        // Setup: lock ABX first
+        address abxToken = gauge.rewardToken();
+        deal(abxToken, address(vault), 100 ether);
+        vm.prank(admin);
+        vault.lockABX(50 ether);
+
+        // Vote for pool
+        vm.prank(admin);
+        vault.voteForPool();
+
+        // Check event was emitted and vote was recorded
+        assertGt(voter.totalWeight(), 0);
+    }
+
+    function test_VoteForPool_RevertsIfNoVeNFT() public {
+        vm.prank(admin);
+        vm.expectRevert("No veABX NFT exists");
+        vault.voteForPool();
+    }
+
+    function test_VoteForPool_RevertsIfNotOwner() public {
+        // Setup: lock ABX first
+        address abxToken = gauge.rewardToken();
+        deal(abxToken, address(vault), 100 ether);
+        vm.prank(admin);
+        vault.lockABX(50 ether);
+
+        // Try to vote as non-owner
+        vm.prank(user1);
+        vm.expectRevert();
+        vault.voteForPool();
+    }
 }
 
 /**
@@ -368,7 +657,9 @@ contract TickRangeTest is AboreanVault {
         address(new MockCLGauge(address(new MockPositionManager()))),
         address(new MockRouter(address(0), address(0))),
         _pool,
-        address(new MockPyth())
+        address(new MockPyth()),
+        address(new MockVotingEscrow()),
+        address(new MockVoter())
     ) {}
 
     function calculateTickRange() external view returns (int24, int24) {

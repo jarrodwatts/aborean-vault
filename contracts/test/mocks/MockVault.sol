@@ -17,8 +17,10 @@ contract MockVault is AboreanVault {
         address _gauge,
         address _router,
         address _pool,
-        address _pyth
-    ) AboreanVault(_weth, _pengu, _positionManager, _gauge, _router, _pool, _pyth) {}
+        address _pyth,
+        address _votingEscrow,
+        address _voter
+    ) AboreanVault(_weth, _pengu, _positionManager, _gauge, _router, _pool, _pyth, _votingEscrow, _voter) {}
 
     /**
      * @notice Override to get amounts from mock instead of calculating from liquidity

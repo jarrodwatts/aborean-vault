@@ -27,6 +27,8 @@ contract VaultForkTest is Test {
     address constant ROUTER = 0xE8142D2f82036B6FC1e79E4aE85cF53FBFfDC998;
     address constant POOL = 0xB3131C7F642be362acbEe0dd0b3e0acc6f05fcDC;
     address constant PYTH = 0x8739d5024B5143278E2b15Bd9e7C26f6CEc658F1;
+    address constant VOTING_ESCROW = 0x27B04370D8087e714a9f557c1EFF7901cea6bB63;
+    address constant VOTER = 0xC0F53703e9f4b79fA2FB09a2aeBA487FA97729c9;
 
     AboreanVault public vault;
     address public admin;
@@ -53,7 +55,9 @@ contract VaultForkTest is Test {
             GAUGE,
             ROUTER,
             POOL,
-            PYTH
+            PYTH,
+            VOTING_ESCROW,
+            VOTER
         );
 
         // Give vault some breathing room for gas in zkSync

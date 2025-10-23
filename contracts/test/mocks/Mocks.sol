@@ -178,10 +178,24 @@ contract MockRouter is IRouter {
         return (0, 0);
     }
 
-    function getAmountsOut(uint256 amountIn, Route[] memory) external pure returns (uint256[] memory amounts) {
+    function getAmountsOut(uint256 amountIn, Route[] memory routes) external view returns (uint256[] memory amounts) {
+        require(routes.length > 0, "No routes");
+        Route memory route = routes[0];
+        
         amounts = new uint256[](2);
         amounts[0] = amountIn;
-        amounts[1] = amountIn * EXCHANGE_RATE;
+        
+        // Handle both directions
+        if (route.from == wethAddr && route.to == penguAddr) {
+            // WETH → PENGU: 1 WETH = 2000 PENGU
+            amounts[1] = amountIn * EXCHANGE_RATE;
+        } else if (route.from == penguAddr && route.to == wethAddr) {
+            // PENGU → WETH: 2000 PENGU = 1 WETH
+            amounts[1] = amountIn / EXCHANGE_RATE;
+        } else {
+            revert("Unsupported route");
+        }
+        
         return amounts;
     }
 
@@ -200,12 +214,22 @@ contract MockRouter is IRouter {
         // Transfer input token from sender
         IERC20(route.from).transferFrom(msg.sender, address(this), amountIn);
 
-        // Calculate output amount
-        uint256 amountOut = amountIn * EXCHANGE_RATE;
-        require(amountOut >= amountOutMin, "Slippage");
-
-        // Mint output tokens to recipient (for testing)
-        MockPENGU(penguAddr).mint(to, amountOut);
+        uint256 amountOut;
+        
+        // Handle both directions: WETH → PENGU and PENGU → WETH
+        if (route.from == wethAddr && route.to == penguAddr) {
+            // WETH → PENGU: 1 WETH = 2000 PENGU
+            amountOut = amountIn * EXCHANGE_RATE;
+            require(amountOut >= amountOutMin, "Slippage");
+            MockPENGU(penguAddr).mint(to, amountOut);
+        } else if (route.from == penguAddr && route.to == wethAddr) {
+            // PENGU → WETH: 2000 PENGU = 1 WETH
+            amountOut = amountIn / EXCHANGE_RATE;
+            require(amountOut >= amountOutMin, "Slippage");
+            IERC20(wethAddr).transfer(to, amountOut);
+        } else {
+            revert("Unsupported route");
+        }
 
         amounts = new uint256[](2);
         amounts[0] = amountIn;
@@ -362,13 +386,51 @@ contract MockPositionManager is ERC721 {
         );
     }
 
-    // Implement other required functions as no-ops
-    function decreaseLiquidity(INonfungiblePositionManager.DecreaseLiquidityParams calldata) external payable returns (uint256, uint256) {
-        revert("Not implemented");
+    // Implement other required functions
+    function decreaseLiquidity(INonfungiblePositionManager.DecreaseLiquidityParams calldata params) external payable returns (uint256 amount0, uint256 amount1) {
+        require(getApproved(params.tokenId) == msg.sender || ownerOf(params.tokenId) == msg.sender, "Not authorized");
+        
+        Position storage pos = positionData[params.tokenId];
+        
+        // Calculate proportional amounts to return
+        if (pos.liquidity > 0) {
+            amount0 = (pos.amount0 * params.liquidity) / pos.liquidity;
+            amount1 = (pos.amount1 * params.liquidity) / pos.liquidity;
+            
+            // Update position
+            pos.liquidity -= params.liquidity;
+            pos.amount0 -= amount0;
+            pos.amount1 -= amount1;
+        }
+        
+        return (amount0, amount1);
     }
 
-    function collect(INonfungiblePositionManager.CollectParams calldata) external payable returns (uint256, uint256) {
-        revert("Not implemented");
+    function collect(INonfungiblePositionManager.CollectParams calldata params) external payable returns (uint256 amount0, uint256 amount1) {
+        // Allow collection even if NFT is staked (gauge owns it)
+        // In reality, the gauge would proxy this call
+        
+        Position storage pos = positionData[params.tokenId];
+        
+        // In a real implementation, this would collect accrued fees
+        // For mock, we'll return any tokens that were withdrawn via decreaseLiquidity
+        // but not yet collected
+        amount0 = IERC20(pos.token0).balanceOf(address(this)) > pos.amount0 
+            ? IERC20(pos.token0).balanceOf(address(this)) - pos.amount0 
+            : 0;
+        amount1 = IERC20(pos.token1).balanceOf(address(this)) > pos.amount1
+            ? IERC20(pos.token1).balanceOf(address(this)) - pos.amount1
+            : 0;
+        
+        // Transfer tokens to recipient
+        if (amount0 > 0) {
+            IERC20(pos.token0).transfer(params.recipient, amount0);
+        }
+        if (amount1 > 0) {
+            IERC20(pos.token1).transfer(params.recipient, amount1);
+        }
+        
+        return (amount0, amount1);
     }
 
     function burn(uint256) external payable {
@@ -383,15 +445,29 @@ contract MockPositionManager is ERC721 {
 }
 
 /**
+ * @title MockABX
+ * @notice Mock ABX reward token
+ */
+contract MockABX is ERC20 {
+    constructor() ERC20("Mock ABX", "ABX") {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
+/**
  * @title MockCLGauge
  * @notice Mock Concentrated Liquidity Gauge for testing staking
  */
 contract MockCLGauge is ICLGauge {
     mapping(uint256 => address) public stakedNFTs;
     address public positionManager;
+    address public immutable abxToken;
 
     constructor(address _positionManager) {
         positionManager = _positionManager;
+        abxToken = address(new MockABX());
     }
 
     function nft() external view returns (address) {
@@ -402,8 +478,8 @@ contract MockCLGauge is ICLGauge {
         return address(0);
     }
 
-    function rewardToken() external pure returns (address) {
-        return address(0);
+    function rewardToken() external view returns (address) {
+        return abxToken;
     }
 
     function feesVotingReward() external pure returns (address) {
@@ -424,12 +500,18 @@ contract MockCLGauge is ICLGauge {
         delete stakedNFTs[tokenId];
     }
 
-    function getReward(uint256) external pure {
-        // No-op for now
+    function getReward(uint256 tokenId) external {
+        // Mint some reward tokens to the position owner
+        address owner = stakedNFTs[tokenId];
+        if (owner != address(0)) {
+            // Mint 1 ABX as mock reward
+            MockABX(abxToken).mint(msg.sender, 1 ether);
+        }
     }
 
-    function getReward(address) external pure {
-        // No-op for now
+    function getReward(address account) external {
+        // Mint some reward tokens to the account
+        MockABX(abxToken).mint(account, 1 ether);
     }
 
     function balanceOf(address) external pure returns (uint256) {
@@ -504,5 +586,65 @@ contract MockUniswapV3Pool {
         bool unlocked
     ) {
         return (sqrtPriceX96, tick, 0, 0, 0, 0, true);
+    }
+}
+
+contract MockVotingEscrow {
+    uint256 public nextTokenId = 1;
+    mapping(uint256 => address) public ownerOf;
+    mapping(uint256 => uint256) public balances;
+    mapping(uint256 => uint256) public lockEnd;
+    
+    function createLock(uint256 _value, uint256 _lockDuration) external returns (uint256) {
+        uint256 tokenId = nextTokenId++;
+        ownerOf[tokenId] = msg.sender;
+        balances[tokenId] = _value;
+        lockEnd[tokenId] = block.timestamp + _lockDuration;
+        return tokenId;
+    }
+    
+    function increaseAmount(uint256 _tokenId, uint256 _value) external {
+        require(ownerOf[_tokenId] == msg.sender, "Not owner");
+        balances[_tokenId] += _value;
+    }
+    
+    function balanceOfNFT(uint256 _tokenId) external view returns (uint256) {
+        return balances[_tokenId];
+    }
+    
+    function isApprovedOrOwner(address _spender, uint256 _tokenId) external view returns (bool) {
+        return ownerOf[_tokenId] == _spender;
+    }
+    
+    function approve(address /*_approved*/, uint256 /*_tokenId*/) external {
+        // Mock: do nothing
+    }
+}
+
+contract MockVoter {
+    event Voted(
+        address indexed voter,
+        address indexed pool,
+        uint256 indexed tokenId,
+        uint256 weight,
+        uint256 totalWeight,
+        uint256 timestamp
+    );
+    
+    mapping(address => address) public gauges;
+    mapping(address => bool) public isAlive;
+    uint256 public totalWeight;
+    
+    function vote(uint256 _tokenId, address[] calldata _poolVote, uint256[] calldata _weights) external {
+        require(_poolVote.length == _weights.length, "Length mismatch");
+        
+        for (uint256 i = 0; i < _poolVote.length; i++) {
+            totalWeight += _weights[i];
+            emit Voted(msg.sender, _poolVote[i], _tokenId, _weights[i], totalWeight, block.timestamp);
+        }
+    }
+    
+    function reset(uint256 /*_tokenId*/) external {
+        // Mock: do nothing
     }
 }
