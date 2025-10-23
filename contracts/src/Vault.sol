@@ -19,7 +19,7 @@ import {PythStructs} from "@pythnetwork/PythStructs.sol";
 
 import {LiquidityAmounts} from "./libraries/LiquidityAmounts.sol";
 import {TickMath} from "./libraries/TickMath.sol";
-import {IUniswapV3Pool} from "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
+import {ICLPool} from "./interfaces/ICLPool.sol";
 
 /**
  * @title AboreanVault
@@ -78,6 +78,9 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard {
 
     /// @notice Tick spacing for CL200 pool
     int24 public constant TICK_SPACING = 200;
+
+    /// @notice Pool fee in hundredths of a basis point (3000 = 0.3%)
+    uint24 public constant POOL_FEE = 3000;
 
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
@@ -329,11 +332,10 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard {
      * @return tickUpper Upper tick of the range
      */
     function _calculateTickRange() internal view returns (int24 tickLower, int24 tickUpper) {
-        // Get current price from pool
-        (uint160 sqrtPriceX96, , , , , , ) = IUniswapV3Pool(pool).slot0();
-
-        // Convert current sqrtPriceX96 to tick
-        int24 currentTick = TickMath.getTickAtSqrtRatio(sqrtPriceX96);
+        // Get current price and tick from pool
+        // slot0() returns: sqrtPriceX96, tick, observationIndex, observationCardinality, observationCardinalityNext, feeProtocol
+        // NOTE: Slipstream pools do NOT return `unlocked` (unlike standard Uniswap V3)
+        (, int24 currentTick, , , , ) = ICLPool(pool).slot0();
 
         // Calculate ±20% range in tick space
         // Price changes by factor of 1.0001 per tick
@@ -361,10 +363,14 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard {
         int24 rounded = (tick / tickSpacing) * tickSpacing;
 
         // Ensure we stay within valid tick range
-        if (rounded < TickMath.MIN_TICK) {
-            return ((TickMath.MIN_TICK / tickSpacing) + 1) * tickSpacing;
-        } else if (rounded > TickMath.MAX_TICK) {
-            return ((TickMath.MAX_TICK / tickSpacing) - 1) * tickSpacing;
+        // MIN_TICK = -887272, MAX_TICK = 887272
+        int24 MIN_TICK = -887272;
+        int24 MAX_TICK = 887272;
+
+        if (rounded < MIN_TICK) {
+            return ((MIN_TICK / tickSpacing) + 1) * tickSpacing;
+        } else if (rounded > MAX_TICK) {
+            return ((MAX_TICK / tickSpacing) - 1) * tickSpacing;
         }
 
         return rounded;
@@ -432,7 +438,7 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard {
      * @return wethAmount Amount of WETH in position (token0)
      * @return penguAmount Amount of PENGU in position (token1)
      */
-    function _getPositionAmounts() internal view returns (uint256 wethAmount, uint256 penguAmount) {
+    function _getPositionAmounts() internal view virtual returns (uint256 wethAmount, uint256 penguAmount) {
         if (nftTokenId == 0) return (0, 0);
 
         // Get position data from NFT
@@ -455,7 +461,7 @@ contract AboreanVault is ERC4626, Ownable, Pausable, ReentrancyGuard {
         // Get current price from the pool (sqrtPriceX96)
         // Note: We use pool price here (not Pyth) because we're calculating position composition,
         // not vault valuation. The actual USD valuation in totalAssets() uses Pyth oracle.
-        (uint160 sqrtPriceX96, , , , , , ) = IUniswapV3Pool(pool).slot0();
+        (uint160 sqrtPriceX96, , , , , ) = ICLPool(pool).slot0();
 
         // Convert tick boundaries to sqrtPriceX96 format
         uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);

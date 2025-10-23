@@ -11,6 +11,8 @@ import {ICLGauge} from "../../src/interfaces/ICLGauge.sol";
 import {IRouter} from "../../src/interfaces/IRouter.sol";
 import {IPyth} from "@pythnetwork/IPyth.sol";
 import {PythStructs} from "@pythnetwork/PythStructs.sol";
+import {LiquidityAmounts} from "../../src/libraries/LiquidityAmounts.sol";
+import {TickMath} from "../../src/libraries/TickMath.sol";
 
 /**
  * @title MockWETH
@@ -237,6 +239,7 @@ contract MockRouter is IRouter {
 /**
  * @title MockPositionManager
  * @notice Mock Concentrated Liquidity Position Manager (NFT)
+ * @dev Simplified mock that tracks actual token amounts deposited
  */
 contract MockPositionManager is ERC721 {
     uint256 private _nextTokenId = 1;
@@ -247,11 +250,19 @@ contract MockPositionManager is ERC721 {
         int24 tickLower;
         int24 tickUpper;
         uint128 liquidity;
+        uint256 amount0;
+        uint256 amount1;
     }
 
     mapping(uint256 => Position) public positionData;
 
     constructor() ERC721("Mock CL Position", "MOCK-POS") {}
+
+    /// @notice Helper to get actual deposited amounts (for testing)
+    function getDepositedAmounts(uint256 tokenId) external view returns (uint256 amount0, uint256 amount1) {
+        Position memory pos = positionData[tokenId];
+        return (pos.amount0, pos.amount1);
+    }
 
     function WETH9() external pure returns (address) {
         return address(0);
@@ -265,10 +276,14 @@ contract MockPositionManager is ERC721 {
     ) {
         tokenId = _nextTokenId++;
 
-        // Simple mock liquidity calculation
-        liquidity = uint128(params.amount0Desired + params.amount1Desired);
+        // For simplicity in mock: just store amounts and use a simple liquidity value
+        // The vault will call getAmountsForLiquidity which will incorrectly reverse this,
+        // so we need to store amounts directly for accurate testing
         amount0 = params.amount0Desired;
         amount1 = params.amount1Desired;
+
+        // Use a simple liquidity value - the position will store actual amounts
+        liquidity = uint128(params.amount0Desired + params.amount1Desired);
 
         // Store position data
         positionData[tokenId] = Position({
@@ -276,7 +291,9 @@ contract MockPositionManager is ERC721 {
             token1: params.token1,
             tickLower: params.tickLower,
             tickUpper: params.tickUpper,
-            liquidity: liquidity
+            liquidity: liquidity,
+            amount0: amount0,
+            amount1: amount1
         });
 
         // Mint NFT to recipient
@@ -304,6 +321,8 @@ contract MockPositionManager is ERC721 {
         amount1 = params.amount1Desired;
 
         pos.liquidity += liquidity;
+        pos.amount0 += amount0;
+        pos.amount1 += amount1;
 
         // Transfer tokens from sender
         IERC20(pos.token0).transferFrom(msg.sender, address(this), amount0);

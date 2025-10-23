@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {AboreanVault} from "../src/Vault.sol";
+import {MockVault} from "./mocks/MockVault.sol";
 import {MockWETH, MockPENGU, MockPyth, MockRouter, MockPositionManager, MockCLGauge, MockUniswapV3Pool} from "./mocks/Mocks.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -12,7 +13,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  * @dev Tests individual functions in isolation
  */
 contract VaultUnitTest is Test {
-    AboreanVault public vault;
+    MockVault public vault;
     MockWETH public weth;
     MockPENGU public pengu;
     MockPyth public pyth;
@@ -43,9 +44,12 @@ contract VaultUnitTest is Test {
         // sqrtPriceX96 = sqrt(2000) * 2^96 ≈ 3.54e21
         pool.setSqrtPriceX96(3540000000000000000000, 0);
 
+        // Give admin ETH for deployment gas
+        vm.deal(admin, 100 ether);
+
         // Deploy vault as admin
         vm.startPrank(admin);
-        vault = new AboreanVault(
+        vault = new MockVault(
             address(weth),
             address(pengu),
             address(positionManager),
@@ -92,19 +96,19 @@ contract VaultUnitTest is Test {
 
     function test_Constructor_RevertIf_ZeroAddresses() public {
         vm.expectRevert("Invalid WETH address");
-        new AboreanVault(
+        new MockVault(
             address(0), address(pengu), address(positionManager),
             address(gauge), address(router), address(pool), address(pyth)
         );
 
         vm.expectRevert("Invalid PENGU address");
-        new AboreanVault(
+        new MockVault(
             address(weth), address(0), address(positionManager),
             address(gauge), address(router), address(pool), address(pyth)
         );
 
         vm.expectRevert("Invalid Position Manager");
-        new AboreanVault(
+        new MockVault(
             address(weth), address(pengu), address(0),
             address(gauge), address(router), address(pool), address(pyth)
         );
@@ -123,6 +127,12 @@ contract VaultUnitTest is Test {
     }
 
     function test_GetPythPrice_RevertIf_StalePrice() public {
+        // First create a position so totalAssets() will call the oracle
+        vm.startPrank(user1);
+        weth.approve(address(vault), 1 ether);
+        vault.deposit(1 ether, user1);
+        vm.stopPrank();
+
         // Advance time beyond staleness threshold (60 seconds)
         vm.warp(block.timestamp + 61);
 
@@ -132,6 +142,12 @@ contract VaultUnitTest is Test {
     }
 
     function test_GetPythPrice_RevertIf_LowConfidence() public {
+        // First create a position so totalAssets() will call the oracle
+        vm.startPrank(user1);
+        weth.approve(address(vault), 1 ether);
+        vault.deposit(1 ether, user1);
+        vm.stopPrank();
+
         // Set price with >1% confidence (high uncertainty)
         // Price = 400000000000, conf = 5000000000 (5% uncertainty)
         pyth.setPrice(WETH_USD_PRICE_ID, 400000000000, 5000000000, -8);

@@ -5,6 +5,9 @@ import {Test, console2} from "forge-std/Test.sol";
 import {AboreanVault} from "../src/Vault.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IWETH} from "../src/interfaces/IWETH.sol";
+import {IRouter} from "../src/interfaces/IRouter.sol";
+import {INonfungiblePositionManager} from "../src/interfaces/INonfungiblePositionManager.sol";
+import {ICLPool} from "../src/interfaces/ICLPool.sol";
 
 /**
  * @title VaultForkTest
@@ -29,12 +32,14 @@ contract VaultForkTest is Test {
     address public user2;
 
     function setUp() public {
-        // Only run on fork
-        vm.createSelectFork("https://api.mainnet.abs.xyz");
-
         admin = address(0x1);
         user1 = address(0x2);
         user2 = address(0x3);
+
+        // Fund accounts with ETH for gas
+        vm.deal(admin, 100 ether);
+        vm.deal(user1, 100 ether);
+        vm.deal(user2, 100 ether);
 
         // Deploy vault with real contracts
         vm.prank(admin);
@@ -47,10 +52,6 @@ contract VaultForkTest is Test {
             POOL,
             PYTH
         );
-
-        // Fund test accounts with ETH
-        vm.deal(user1, 100 ether);
-        vm.deal(user2, 100 ether);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -90,12 +91,20 @@ contract VaultForkTest is Test {
 
         vm.startPrank(user1);
         IWETH(WETH).deposit{value: depositAmount}();
+        console2.log("WETH balance after deposit:", IERC20(WETH).balanceOf(user1));
+
         IERC20(WETH).approve(address(vault), depositAmount);
+        console2.log("Approved vault to spend WETH");
+
+        console2.log("About to call vault.deposit()");
         vault.deposit(depositAmount, user1);
+        console2.log("Vault deposit succeeded");
+
         vm.stopPrank();
 
         // Get total assets (uses real Pyth prices)
         uint256 totalAssets = vault.totalAssets();
+        console2.log("Total assets:", totalAssets);
 
         // Should be close to deposit amount (within slippage tolerance)
         assertGt(totalAssets, 0);
@@ -149,6 +158,80 @@ contract VaultForkTest is Test {
 
         // Verify position was created successfully (proves swap worked)
         assertGt(vault.nftTokenId(), 0);
+    }
+
+    /**
+     * @notice Test: Direct Position Manager mint call to debug
+     */
+    function test_Fork_Debug_DirectMint() public {
+        uint256 wethAmount = 0.5 ether;
+        uint256 penguAmount = 95 ether; // Approximate ratio
+
+        vm.startPrank(user1);
+
+        // Get WETH and PENGU
+        IWETH(WETH).deposit{value: 1 ether}();
+
+        // Get PENGU by swapping (simplified - just use router)
+        IERC20(WETH).approve(ROUTER, 0.5 ether);
+
+        // Build route for swap
+        IRouter.Route[] memory routes = new IRouter.Route[](1);
+        routes[0] = IRouter.Route({
+            from: WETH,
+            to: PENGU,
+            stable: false,
+            factory: address(0)
+        });
+
+        IRouter(ROUTER).swapExactTokensForTokens(
+            0.5 ether,
+            0,
+            routes,
+            user1,
+            block.timestamp
+        );
+
+        uint256 penguBalance = IERC20(PENGU).balanceOf(user1);
+        console2.log("PENGU balance:", penguBalance);
+
+        // Approve position manager
+        IERC20(WETH).approve(POSITION_MANAGER, wethAmount);
+        IERC20(PENGU).approve(POSITION_MANAGER, penguBalance);
+
+        // Get current tick from pool (Slipstream slot0 returns 6 values, not 7)
+        (, int24 currentTick, , , , ) = ICLPool(POOL).slot0();
+        console2.log("Current tick:", uint256(int256(currentTick)));
+
+        // Calculate tick range
+        int24 tickRange = 1823;
+        int24 tickLower = ((currentTick - tickRange) / 200) * 200;
+        int24 tickUpper = ((currentTick + tickRange) / 200) * 200;
+
+        console2.log("Tick lower:", uint256(int256(tickLower)));
+        console2.log("Tick upper:", uint256(int256(tickUpper)));
+
+        // Try to mint
+        INonfungiblePositionManager.MintParams memory params = INonfungiblePositionManager.MintParams({
+            token0: WETH,
+            token1: PENGU,
+            tickSpacing: 200,
+            tickLower: tickLower,
+            tickUpper: tickUpper,
+            amount0Desired: wethAmount,
+            amount1Desired: penguBalance,
+            amount0Min: 0,
+            amount1Min: 0,
+            recipient: user1,
+            deadline: block.timestamp,
+            sqrtPriceX96: 0
+        });
+
+        console2.log("About to call mint...");
+        (uint256 tokenId, , , ) = INonfungiblePositionManager(POSITION_MANAGER).mint(params);
+        console2.log("Minted tokenId:", tokenId);
+
+        vm.stopPrank();
     }
 
     /**
